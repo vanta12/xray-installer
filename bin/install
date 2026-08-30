@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Jalankan via one-liner (tanpa file bootstrap apapun):
+#   curl -fsSL https://raw.githubusercontent.com/vanta12/xray-installer/main/bin/install | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/vanta12/xray-installer/main/bin/install | sudo bash -s domain.com
+# Atau dari repo lokal: sudo ./bin/install
+#
+# Pola main() (rustup-style): saat di-pipe, bash membaca seluruh script ini dulu
+# sebelum mengeksekusi, sehingga stdin tetap bebas untuk prompt interaktif.
+main() {
+  local ROOT
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")/.." 2>/dev/null && pwd)" || ROOT=""
+  if [[ ! -f "$ROOT/lib/paths.sh" ]]; then
+    # Mode bootstrap: script ini diunduh sendiri via curl (repo tidak ada di lokal).
+    [[ $EUID -eq 0 ]] || { echo "Jalankan sebagai root: curl -fsSL ... | sudo bash" >&2; exit 1; }
+    local TMPD
+    TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
+    command -v curl >/dev/null || { apt-get update -y && apt-get install -y curl; }
+    [[ -n "${1:-}" ]] && export XRAY_INSTALL_DOMAIN="$1"
+    curl -fsSL "https://codeload.github.com/vanta12/xray-installer/tar.gz/refs/heads/main" | tar -xz -C "$TMPD"
+    exec bash "$TMPD"/xray-installer-main/bin/install
+  fi
+  [[ -n "${1:-}" ]] && export XRAY_INSTALL_DOMAIN="$1"
+  source "$ROOT/lib/paths.sh"; source "$ROOT/lib/common.sh"; source "$ROOT/lib/validation.sh"; source "$ROOT/lib/system.sh"; source "$ROOT/lib/certificate.sh"; source "$ROOT/lib/nginx-setup.sh"; source "$ROOT/lib/xray-setup.sh"; source "$ROOT/lib/xray-service.sh"; source "$ROOT/lib/systemd-setup.sh"; source "$ROOT/lib/runtime.sh"
+
+  require_root; require_systemd; require_debian
+  install -d -m 0755 "${LOG_FILE%/*}"; : > "$LOG_FILE"; chmod 0600 "$LOG_FILE"; exec > >(tee -ia "$LOG_FILE") 2>&1
+  # Input domain: env (otomasi) -> stdin terminal -> /dev/tty (saat curl ... | bash, stdin=pipe script).
+  if [[ -n "${XRAY_INSTALL_DOMAIN:-}" ]]; then
+    DOMAIN="$XRAY_INSTALL_DOMAIN"
+  elif [[ -t 0 ]]; then
+    read -r -p 'Domain untuk SSL (contoh: vpn.example.com): ' DOMAIN
+  else
+    read -r -p 'Domain untuk SSL (contoh: vpn.example.com): ' DOMAIN < /dev/tty
+  fi
+  validate_domain "$DOMAIN"
+  if [[ -f "$USERS_FILE" ]]; then
+    warn "users.json sudah ada. Instalasi ulang AKAN MENIMPA tanpa backup — semua user non-admin hilang, semua UUID/password/path lama mati seketika."
+  fi
+  install_dependencies
+  curl -fsS -m 10 -o /dev/null http://1.1.1.1/ || die 'Tidak ada koneksi internet.'
+  validate_dns "$DOMAIN"
+  CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+  # Rerun dengan domain baru saat Xray masih berjalan: certbot standalone butuh port 80 bebas.
+  if [[ ! -s "$CERT_DIR/fullchain.pem" ]] && ss -ltnp 2>/dev/null | grep -Eq ':(80|443)\s'; then
+    if ss -ltnp 2>/dev/null | grep -E ':(80|443)\s' | grep -q xray; then
+      warn "Port 80/443 dipegang Xray (instalasi ulang); dihentikan sementara untuk penerbitan sertifikat."
+      systemctl stop "$SERVICE" 2>/dev/null || true
+    else
+      die "Port 80/443 dipakai service lain. Hentikan service itu lalu jalankan ulang installer."
+    fi
+  fi
+  validate_or_obtain_certificate "$DOMAIN" "$CERT_DIR/fullchain.pem" "$CERT_DIR/privkey.pem"
+  configure_timezone; configure_ipv4_only
+  install_nginx
+  install_xray
+  grant_xray_cert_access "$DOMAIN"
+  generate_site_parameters
+  install -d -m 0700 /etc/xray-users
+  # Tulis users.json di bawah lock bersama (menu/cleanup memakai flock yang sama)
+  # agar rerun installer tidak bersaing dengan update menu atau prune cleanup.
+  users_lock
+  USERS_TMP=$(mktemp /etc/xray-users/users.json.tmp.XXXXXX); register_tmp "$USERS_TMP"
+  XRAY_USER_UUID="$(cat /proc/sys/kernel/random/uuid)" XRAY_USER_TROJAN="$(gen_trojan)" jq -n --arg domain "$DOMAIN" --arg cert "$CERT_DIR/fullchain.pem" --arg key "$CERT_DIR/privkey.pem" --arg h1 "$H1_SOCK" --arg h2 "$H2C_SOCK" --argjson tc_vm "$P_TC_VM" --argjson tc_tr "$P_TC_TR" --argjson ws_vl "$P_WS_VL" --argjson ws_vm "$P_WS_VM" --argjson ws_tr "$P_WS_TR" --argjson hu_vl "$P_HU_VL" --argjson hu_vm "$P_HU_VM" --argjson hu_tr "$P_HU_TR" --argjson xh_vl "$P_XH_VL" --argjson xh_vm "$P_XH_VM" --argjson xh_tr "$P_XH_TR" --argjson gr_vl "$P_GR_VL" --argjson gr_vm "$P_GR_VM" --argjson gr_tr "$P_GR_TR" --arg vl_ws "$P_VL_WS" --arg vm_ws "$P_VM_WS" --arg tr_ws "$P_TR_WS" --arg vl_hu "$P_VL_HU" --arg vm_hu "$P_VM_HU" --arg tr_hu "$P_TR_HU" --arg vl_xh "$P_VL_XH" --arg vm_xh "$P_VM_XH" --arg tr_xh "$P_TR_XH" --arg g_vl "$G_VL" --arg g_vm "$G_VM" --arg g_tr "$G_TR" '{site:{domain:$domain,cert_file:$cert,key_file:$key,h1_sock:$h1,h2c_sock:$h2,ports:{tc_vm:$tc_vm,tc_tr:$tc_tr,ws_vl:$ws_vl,ws_vm:$ws_vm,ws_tr:$ws_tr,hu_vl:$hu_vl,hu_vm:$hu_vm,hu_tr:$hu_tr,xh_vl:$xh_vl,xh_vm:$xh_vm,xh_tr:$xh_tr,gr_vl:$gr_vl,gr_vm:$gr_vm,gr_tr:$gr_tr},paths:{vl_ws:$vl_ws,vm_ws:$vm_ws,tr_ws:$tr_ws,vl_hu:$vl_hu,vm_hu:$vm_hu,tr_hu:$tr_hu,vl_xh:$vl_xh,vm_xh:$vm_xh,tr_xh:$tr_xh},grpc:{vl:$g_vl,vm:$g_vm,tr:$g_tr}},users:[{name:"admin",uuid:$ENV.XRAY_USER_UUID,trojan:$ENV.XRAY_USER_TROJAN,protocols:["vless","vmess","trojan"],expires:null}]}' > "$USERS_TMP"
+  chmod 0600 "$USERS_TMP"; mv -f "$USERS_TMP" "$USERS_FILE"; TMP_FILES=(); users_unlock
+  write_nginx_config; validate_nginx; start_nginx
+  install_runtime; "$XRAY_CONFIG" build
+  setup_renewal_hook
+  systemctl daemon-reload; verify_systemd_units "$SERVICE"; systemctl enable --now "$SERVICE"; validate_xray_runtime
+  setup_cleanup_timer
+  "$XRAY_CONFIG" links admin
+  log 'Instalasi modular selesai.'
+}
+main "$@"

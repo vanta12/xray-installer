@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$ROOT/lib/paths.sh" ]]; then RUNTIME_ROOT="$ROOT"; else RUNTIME_ROOT="${XRAY_RUNTIME_DIR:-/usr/local/lib/xray-installer}"; fi
+source "$RUNTIME_ROOT/lib/paths.sh"
+source "$RUNTIME_ROOT/lib/common.sh"
+source "$RUNTIME_ROOT/lib/users.sh"
+source "$RUNTIME_ROOT/lib/config-builder.sh"
+source "$RUNTIME_ROOT/lib/link-builder.sh"
+USERS_FILE="${USERS_FILE:-/etc/xray-users/users.json}"
+CONFIG="${CONFIG:-/usr/local/etc/xray/config.json}"
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+export XRAY_BIN CONFIG USERS_FILE
+[[ -f "$USERS_FILE" ]] || die "users.json tidak ada."
+users_validate
+case "${1:-}" in build) build_xray_config;; links) print_user_links "${2:-}";; *) die "usage: $0 {build|links <nama-user>}";; esac

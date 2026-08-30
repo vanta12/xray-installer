@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+XRAY_DIR="/usr/local/etc/xray"
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+CONFIG="${CONFIG:-$XRAY_DIR/config.json}"
+SERVICE="xray.service"
+NGINX_CONF="/etc/nginx/conf.d/xray.conf"
+DECOY_DIR="/var/www/html"
+H1_SOCK="/dev/shm/h1.sock"
+H2C_SOCK="/dev/shm/h2c.sock"
+USERS_FILE="${USERS_FILE:-/etc/xray-users/users.json}"
+LOCK_FILE="${LOCK_FILE:-/etc/xray-users/.lock}"
+LOG_FILE="${LOG_FILE:-/var/log/xray-installer.log}"
+XRAY_RUNTIME_DIR="${XRAY_RUNTIME_DIR:-/usr/local/lib/xray-installer}"
+XRAY_CONFIG="${XRAY_CONFIG:-/usr/local/bin/xray-config}"
+XRAY_CLEANUP="${XRAY_CLEANUP:-/usr/local/bin/xray-cleanup}"

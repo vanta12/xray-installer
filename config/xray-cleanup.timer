@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer for xray-cleanup (prune expired users)
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 Asia/Jakarta
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

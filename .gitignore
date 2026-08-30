@@ -1,0 +1,12 @@
+# Logs & temporary files
+*.log
+*.tmp
+*.bak
+
+# Tests tidak untuk distribusi publik
+tests/
+
+# Editor/OS junk
+.DS_Store
+*.swp
+*~

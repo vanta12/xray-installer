@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# Cegah warning debconf saat apt dijalankan tanpa tty (cron/pipe).
+export DEBIAN_FRONTEND=noninteractive TERM=dumb
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/lib/paths.sh"
+
+[[ $EUID -eq 0 ]] || { echo 'Jalankan sebagai root.' >&2; exit 1; }
+read -r -p "Yakin uninstall? ketik 'y' untuk lanjut: " confirm
+[[ "$confirm" == y ]] || exit 1
+systemctl stop "$SERVICE" 2>/dev/null || true
+systemctl disable "$SERVICE" 2>/dev/null || true
+systemctl stop xray-cleanup.timer 2>/dev/null || true
+systemctl disable xray-cleanup.timer 2>/dev/null || true
+systemctl stop nginx 2>/dev/null || true
+systemctl disable nginx 2>/dev/null || true
+certbot delete --cert-name "$(jq -r '.site.domain // empty' "$USERS_FILE" 2>/dev/null || true)" --non-interactive 2>/dev/null || true
+apt-get purge -y nginx certbot 2>/dev/null || true
+apt-get autoremove -y 2>/dev/null || true
+rm -f -- /etc/systemd/system/xray-cleanup.service /etc/systemd/system/xray-cleanup.timer /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+for p in /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d "$XRAY_DIR" /usr/local/share/xray /etc/xray-users /var/log/xray /var/www/certbot "$XRAY_RUNTIME_DIR"; do
+  case "$p" in /var/*|/usr/*|/etc/*) rm -rf -- "$p";; *) echo "Lewati hapus (path tak dikenal): $p" >&2;; esac
+done
+# Decoy: hapus file installer saja, jangan seluruh /var/www/html (bisa berisi file user).
+rm -f -- "$DECOY_DIR/index.html"
+rmdir --ignore-fail-on-non-empty "$DECOY_DIR" 2>/dev/null || true
+rm -f -- "$XRAY_BIN" "$NGINX_CONF" "$H1_SOCK" "$H2C_SOCK" /usr/local/bin/xray-config /usr/local/bin/menu /usr/local/bin/xray-cleanup /usr/local/bin/uninstall /etc/letsencrypt/renewal-hooks/deploy/xray-reload.sh "$LOG_FILE"
+rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/preferences.d/99nginx /usr/share/keyrings/nginx-archive-keyring.gpg
+systemctl daemon-reload
+if [[ -f /etc/sysctl.d/99-disable-ipv6.conf ]]; then rm -f /etc/sysctl.d/99-disable-ipv6.conf; sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true; fi
+if id -u xray >/dev/null 2>&1; then userdel -r xray 2>/dev/null || true; fi
+echo 'Uninstall selesai.'

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$ROOT/lib/paths.sh" ]]; then RUNTIME_ROOT="$ROOT"; else RUNTIME_ROOT="${XRAY_RUNTIME_DIR:-/usr/local/lib/xray-installer}"; fi
+source "$RUNTIME_ROOT/lib/paths.sh"; source "$RUNTIME_ROOT/lib/common.sh"; source "$RUNTIME_ROOT/lib/users.sh"; source "$RUNTIME_ROOT/lib/xray-service.sh"
+[[ -f "$USERS_FILE" ]] || die "users.json tidak ada."
+if ! users_lock_nb; then echo 'users.json sedang dipakai proses lain (menu/install); dilewati.'; exit 0; fi
+if users_prune_expired; then
+  USERS_FILE="$PRUNE_TMP" "$XRAY_CONFIG" build || die "Build dari hasil prune gagal — users.json TIDAK diubah."
+  mv -f "$PRUNE_TMP" "$USERS_FILE"; chmod 0600 "$USERS_FILE"
+  reload_xray; echo 'User expired dibersihkan dan Xray dimuat ulang.'
+else
+  "$XRAY_CONFIG" build || die "Build config gagal."
+  reload_xray; echo 'Tidak ada user yang lewat masa aktif.'
+fi
+users_unlock

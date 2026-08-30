@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$ROOT/lib/paths.sh" ]]; then RUNTIME_ROOT="$ROOT"; else RUNTIME_ROOT="${XRAY_RUNTIME_DIR:-/usr/local/lib/xray-installer}"; fi
+source "$RUNTIME_ROOT/lib/paths.sh"
+source "$RUNTIME_ROOT/lib/common.sh"
+source "$RUNTIME_ROOT/lib/users.sh"
+source "$RUNTIME_ROOT/lib/xray-service.sh"
+source "$RUNTIME_ROOT/lib/menu-ui.sh"
+
+[[ $EUID -eq 0 ]] || die "Jalankan sebagai root."
+[[ -f "$USERS_FILE" ]] || die "users.json tidak ada. Jalankan bin/install dulu."
+[[ -x "$XRAY_CONFIG" ]] || die "xray-config tidak ada. Jalankan bin/install dulu."
+users_validate
+
+# Nomor (1..total) -> nama user non-admin. Gagal = rc 1.
+select_user() {
+  local num=${1:-} total name
+  num="${num#"${num%%[!0]*}"}"; num="${num:-0}"   # strip leading-zero (oktal), "08" -> "8"
+  total=$(jq '[.users[] | select(.name != "admin")] | length' "$USERS_FILE")
+  [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= total )) || return 1
+  name=$(jq -r --argjson i "$((num - 1))" '([.users[] | select(.name != "admin")])[$i].name' "$USERS_FILE")
+  [[ -n "$name" && "$name" != admin ]] || return 1
+  printf '%s' "$name"
+}
+
+menu_users_list() {
+  printf '  %s%-3s %s%s\n' "$UI_C" 'NO' 'NAMA' "$UI_R"
+  local no=0 n
+  while IFS=$'\t' read -r n; do
+    no=$((no + 1)); printf '  %-3s %s\n' "$no" "$n"
+  done < <(jq -r '.users[] | select(.name != "admin") | [.name] | @tsv' "$USERS_FILE")
+}
+
+# Pilih protokol via menu bernomor; 00=kembali. stdout murni nama protokol.
+pick_protocol() {
+  # Menu ke stderr: fungsi dipanggil via $(pick_protocol) sehingga stdout harus MURNI hasil pilihan.
+  printf '  %sProtokol (pilih satu):%s\n' "$UI_G" "$UI_R" >&2
+  printf '    1. VLESS\n    2. VMess\n    3. Trojan\n' >&2
+  while true; do
+    read -r -p '  Protokol  : ' raw
+    [[ -z "$raw" ]] && { ui_note 'Ketik 1, 2, atau 3 (baris kosong mengulang).'; continue; }
+    ui_cancel "$raw" && return 1
+    case "$raw" in
+      1|vless)  printf '%s' vless; return 0;;
+      2|vmess)  printf '%s' vmess; return 0;;
+      3|trojan) printf '%s' trojan; return 0;;
+      *) ui_err 'Protokol tidak valid. Pilih 1, 2, atau 3.';;
+    esac
+  done
+}
+
+# Pilih user: terima NOMOR atau NAMA (prefix unik). Kosong / q / b / batal = kembali ke menu.
+# Daftar user dicetak ke stderr sehingga stdout hanya berisi nama terpilih (aman untuk $(...)).
+pick_user() {
+  local tok name cnt exact
+  menu_users_list >&2
+  while true; do
+    read -r -p '  Nomor/nama (00=kembali) : ' tok
+    [[ -z "$tok" ]] && { ui_note 'Ketik 00 untuk kembali ke menu.'; continue; }
+    ui_cancel "$tok" && return 1
+    if [[ "$tok" =~ ^[0-9]+$ ]]; then
+      # Nomor baris dulu (sesuai daftar); fallback ke nama all-digit bila ada.
+      if name=$(select_user "$tok"); then printf '%s' "$name"; return 0; fi
+      exact=$(jq -r --arg n "$tok" '[.users[] | select(.name != "admin" and .name == $n)] | .[0].name // empty' "$USERS_FILE")
+      if [[ -n "$exact" ]]; then printf '%s' "$exact"; return 0; fi
+      ui_err 'Nomor tidak valid.'; ui_pause; return 1
+    fi
+    exact=$(jq -r --arg n "$tok" '[.users[] | select(.name != "admin" and .name == $n)] | .[0].name // empty' "$USERS_FILE")
+    if [[ -n "$exact" ]]; then printf '%s' "$exact"; return 0; fi
+    cnt=$(jq -r --arg p "$tok" '[.users[] | select(.name != "admin" and (.name|ascii_downcase|startswith($p|ascii_downcase)))] | length' "$USERS_FILE")
+    if (( cnt == 0 )); then
+      ui_err "Tidak ada user berawalan '$tok'."; ui_pause; return 1
+    elif (( cnt > 1 )); then
+      ui_err "Awalan '$tok' cocok ${cnt} user. Ketik lebih spesifik."; ui_pause; return 1
+    fi
+    name=$(jq -r --arg p "$tok" '([.users[] | select(.name != "admin" and (.name|ascii_downcase|startswith($p|ascii_downcase)))] | .[0].name)' "$USERS_FILE")
+    printf '%s' "$name"; return 0
+  done
+}
+
+list_users() {
+  menu_banner; ui_panel 'DAFTAR USER'
+  if ! jq -e '[.users[] | select(.name != "admin")] | length > 0' "$USERS_FILE" >/dev/null 2>&1; then
+    ui_note 'Belum ada user (selain admin). Gunakan menu Tambah User.'
+    ui_pause; return
+  fi
+  printf '  %s%-4s %-20s %-16s %s%s\n' "$UI_C" 'NO' 'NAMA' 'MASA AKTIF' 'PROTOKOL' "$UI_R"
+  local no=0 n p e
+  while IFS=$'\t' read -r n p e; do
+    no=$((no + 1)); [[ -n "$e" ]] || e='tak terbatas'
+    printf '  %-4s %-20.20s %-16s %s\n' "$no" "$n" "$e" "$p"
+  done < <(jq -r '.users[] | select(.name != "admin") | [.name, (.protocols|join(",")), (.expires // "")] | @tsv' "$USERS_FILE")
+  ui_pause
+}
+
+add_user() {
+  menu_banner; ui_panel 'TAMBAH USER'
+  ui_note 'Ketik 00 kapan saja untuk kembali ke menu.'
+  ui_note 'Nama: huruf/angka/underscore, maks 24 karakter.'
+  read -r -p '  Nama user : ' name
+  name="${name#"${name%%[! ]*}"}"; name="${name%"${name##*[! ]}"}"
+  ui_cancel "$name" && { ui_note 'Dibatalkan. Kembali ke menu.'; return; }
+  name=${name// /_}
+  [[ "$name" =~ ^[a-zA-Z0-9_]{1,24}$ ]] || { ui_err 'Nama tidak valid.'; ui_pause; return; }
+  jq -e --arg n "$name" '.users | any((.name|ascii_downcase) == ($n|ascii_downcase))' "$USERS_FILE" >/dev/null && { ui_err "User '$name' sudah ada (abaikan huruf besar/kecil)."; ui_pause; return; }
+  local proto
+  proto=$(pick_protocol) || { ui_note 'Dibatalkan. Kembali ke menu.'; return 0; }
+  case "$proto" in
+    vless|vmess|trojan) : ;;
+    *) ui_err 'Protokol tidak valid.'; ui_pause; return;;
+  esac
+  local -a selected=( "$proto" )
+  read -r -p '  Masa aktif (hari, kosong=tak terbatas) : ' days
+  ui_cancel "$days" && { ui_note 'Dibatalkan. Kembali ke menu.'; return; }
+  local expires=''
+  if [[ -n "$days" ]]; then
+    if [[ "$days" =~ ^[0-9]+$ ]] && (( days > 0 )); then
+      expires=$(TZ=Asia/Jakarta date -d "+$days days" +%F)
+    else
+      ui_err 'Jumlah hari tidak valid.'; ui_pause; return
+    fi
+  fi
+  local tmp; tmp=$(mktemp "${USERS_FILE}.tmp.XXXXXX"); register_tmp "$tmp"
+  jq --arg n "$name" --arg u "$(cat /proc/sys/kernel/random/uuid)" --arg t "$(gen_trojan)" --arg e "$expires" --argjson p "$(printf '%s\n' "${selected[@]}" | jq -R . | jq -s -c .)" '.users += [{name:$n,uuid:$u,trojan:$t,protocols:$p,expires:($e|if .=="" then null else . end)}]' "$USERS_FILE" > "$tmp"
+  menu_update_users "$tmp"
+  ui_ok "User '$name' dibuat ($(printf '%s' "${selected[*]}" | tr ' ' ',')). Link di bawah:"
+  "$XRAY_CONFIG" links "$name" || { ui_err 'Gagal menghasilkan link.'; }
+  ui_pause
+}
+
+delete_user() {
+  menu_banner; ui_panel 'HAPUS USER'
+  local name
+  name=$(pick_user) || return 0
+  read -r -p "  Hapus '$name'? [y/N] : " ok; [[ "${ok,,}" == y ]] || { ui_note 'Dibatalkan.'; ui_pause; return; }
+  local tmp; tmp=$(mktemp "${USERS_FILE}.tmp.XXXXXX"); register_tmp "$tmp"
+  jq --arg n "$name" '.users |= map(select(.name != $n))' "$USERS_FILE" > "$tmp"; menu_update_users "$tmp"
+  ui_ok "User '$name' dihapus."
+  ui_pause
+}
+
+show_links() {
+  menu_banner; ui_panel 'TAMPILKAN LINK'
+  local name
+  name=$(pick_user) || return 0
+  "$XRAY_CONFIG" links "$name" || { ui_err 'Gagal membuat link.'; }
+  ui_pause
+}
+
+extend_user() {
+  menu_banner; ui_panel 'PERPANJANG MASA AKTIF'
+  local name cur days new tmp base
+  name=$(pick_user) || return 0
+  cur=$(jq -r --arg n "$name" '.users[]|select(.name==$n)|.expires//empty' "$USERS_FILE")
+  ui_note "Masa aktif saat ini: ${cur:-tak terbatas}"
+  read -r -p '  Tambah berapa hari? (00=kembali) : ' days
+  [[ -z "$days" ]] && { ui_err 'Jumlah hari tidak valid.'; ui_pause; return; }
+  ui_cancel "$days" && { ui_note 'Dibatalkan.'; return; }
+  if ! [[ "$days" =~ ^[0-9]+$ ]] || (( days <= 0 )); then ui_err 'Jumlah hari tidak valid.'; ui_pause; return; fi
+  if [[ -n "$cur" ]]; then
+    base="$cur"
+    if [[ "$base" < "$(TZ=Asia/Jakarta date +%F)" ]]; then
+      ui_note 'Masa aktif sudah lewat; dihitung mulai hari ini.'
+      base="$(TZ=Asia/Jakarta date +%F)"
+    fi
+    new=$(TZ=Asia/Jakarta date -d "$base + $days days" +%F)
+  else
+    new=$(TZ=Asia/Jakarta date -d "+$days days" +%F)
+  fi
+  tmp=$(mktemp "${USERS_FILE}.tmp.XXXXXX"); register_tmp "$tmp"
+  jq --arg n "$name" --arg e "$new" '.users |= map(if .name==$n then .expires=$e else . end)' "$USERS_FILE" > "$tmp"; menu_update_users "$tmp"
+  ui_ok "Masa aktif '$name' diperpanjang: s.d. $new"
+  ui_pause
+}
+
+status_view() {
+  menu_banner; ui_panel 'STATUS LAYANAN'
+  if systemctl is-active --quiet xray.service 2>/dev/null; then
+    printf '  Layanan : %s● Active%s  (xray %s)\n' "$UI_G" "$UI_R" "$(xray version 2>/dev/null | head -1 | awk '{print $2}' || echo '?')"
+  else
+    printf '  Layanan : %s● Inactive%s\n' "$UI_Rd" "$UI_R"
+  fi
+  printf '\n'
+  systemctl status xray.service --no-pager | sed -n '1,12p' || true
+  ui_pause
+}
+
+while true; do
+  menu_banner
+  printf '  %sUSER MANAGEMENT%s\n' "$UI_G" "$UI_R"
+  printf '      %-20s %s\n' '1. List User' '2. Tambah User'
+  printf '      %-20s %s\n' '3. Hapus User' '4. Tampilkan Link'
+  printf '      %-20s %s\n' '5. Perpanjang' '6. Status Layanan'
+  printf '  %sSYSTEM%s\n' "$UI_G" "$UI_R"
+  printf '      %-20s ~ Enter = muat ulang\n\n' '0. Keluar'
+  read -r -p '  Pilih : ' choice
+  [[ -z "$choice" ]] && continue
+  case "$choice" in
+    1) list_users;;
+    2) add_user;;
+    3) delete_user;;
+    4) show_links;;
+    5) extend_user;;
+    6) status_view;;
+    0) exit 0;;
+    00) continue;;
+    *) echo "  ${UI_Rd}Pilihan tidak dikenal.${UI_R} Pilih 0-6.";;
+  esac
+done

@@ -1,0 +1,8 @@
+[Unit]
+Description=Prune expired Xray users and rebuild config
+After=network.target xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-cleanup
+SyslogIdentifier=xray-cleanup
