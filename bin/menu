@@ -186,6 +186,22 @@ status_view() {
   ui_pause
 }
 
+# Uninstall lengkap via menu. Script uninstall punya konfirmasi y/N sendiri;
+# bila dikonfirmasi, binary menu ikut terhapus -> keluar dari menu.
+menu_uninstall() {
+  menu_banner; ui_panel 'UNINSTALL'
+  ui_err 'Menghapus TOTAL: Xray, nginx, sertifikat LE, semua user & konfigurasi (tanpa backup).'
+  ui_note 'Konfirmasi terakhir diminta oleh script uninstall (y).'
+  if [[ ! -x /usr/local/bin/uninstall ]]; then ui_err 'Script uninstall tidak ditemukan. Jalankan bin/install ulang.'; ui_pause; return; fi
+  /usr/local/bin/uninstall || true
+  if [[ ! -e /usr/local/bin/uninstall ]]; then
+    ui_ok 'Uninstall selesai. Menu ditutup.'
+    exit 0
+  fi
+  ui_note 'Uninstall dibatalkan. Kembali ke menu.'
+  ui_pause
+}
+
 while true; do
   menu_banner
   printf '  %sUSER MANAGEMENT%s\n' "$UI_G" "$UI_R"
@@ -193,7 +209,8 @@ while true; do
   printf '      %-20s %s\n' '3. Hapus User' '4. Tampilkan Link'
   printf '      %-20s %s\n' '5. Perpanjang' '6. Status Layanan'
   printf '  %sSYSTEM%s\n' "$UI_G" "$UI_R"
-  printf '      %-20s ~ Enter = muat ulang\n\n' '0. Keluar'
+  printf '      %-20s %s\n' '7. Uninstall' '0. Keluar'
+  printf '      %-20s ~ Enter = muat ulang\n\n' ''
   read -r -p '  Pilih : ' choice
   [[ -z "$choice" ]] && continue
   case "$choice" in
@@ -203,8 +220,9 @@ while true; do
     4) show_links;;
     5) extend_user;;
     6) status_view;;
+    7) menu_uninstall;;
     0) exit 0;;
     00) continue;;
-    *) echo "  ${UI_Rd}Pilihan tidak dikenal.${UI_R} Pilih 0-6.";;
+    *) echo "  ${UI_Rd}Pilihan tidak dikenal.${UI_R} Pilih 0-7.";;
   esac
 done
